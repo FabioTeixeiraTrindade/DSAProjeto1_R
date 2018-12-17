@@ -1,0 +1,644 @@
+---
+title: "Detecção de Fraudes em Cliques"
+author: "Fábio Teixeira Trindade"
+date: "15 de dezembro de 2018"
+output:
+  word_document: default
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Descrição do Projeto
+
+Título: Detecção de Fraudes no Tráfego de Cliques em Propagandas de Aplicações Mobile   utilizando Random Forest, Árvore de Decisão, SVM, Regressão Logística e Naive Bayes.
+
+A TalkingData, a maior plataforma de Big Data independente da China, cobre mais de 70% dos dispositivos móveis ativos no país. Eles lidam com 3 bilhões de cliques por dia, dos quais 90% são potencialmente fraudulentos. Sua abordagem atual para impedir fraudes de cliques para desenvolvedores de aplicativos é medir a jornada do clique de um usuário em todo o portfólio e sinalizar endereços IP que produzem muitos cliques, mas nunca acabam instalando aplicativos. Com essas informações, eles criaram uma lista negra de IPs e uma lista negra de dispositivos. 
+ 
+Embora bem-sucedidos, eles querem estar sempre um passo à frente dos fraudadores e pediram a sua ajuda para criar um algoritmo que possa prever se um usuário fará o download de um aplicativo depois de clicar em um anúncio de aplicativo para dispositivos móveis.  
+ 
+Em resumo, neste projeto, você  deverá  construir  um modelo de aprendizado de máquina para determinar se um clique é fraudulento ou não.
+
+Os dados disponíveis são dados mascarados (somente podemos ver os códigos, não os dados reais), prática estabelecida no GDPR (Regulação de Proteção de dados Genéricos), isso deve ser adotado por todas as companhias que mantem base de dados.
+
+Cada linha dos dados de treino contém o registro de um click, com as seguintes variáveis:
+
+1. __ip__: endereço ip do click;
+2. __app__: identificação do app para usada no marketing;
+3. __device__: identificação do tipo de dispositivo do celular do usuário (por exemplo, iphone 6 plus, iphone 7, huawei mate 7, etc.);
+4. __os__: versão do sistema operacional do celular;
+5. __channel__: canal de quem faz a chamado do marketing no celular;
+6. __click_time__: data e hora do click (UTC);
+7. __attributed_time__: Se o usuário fizer o download após clicar na propaganda, essa é a hora de download do app;
+8. __is_attributed__: variável target que será predita no modelo, que indica se a app foi baixada (downloaded).
+
+
+## Carregamento e Preparação dos Dados
+
+```{r carrega pacotes, message=FALSE, warning=FALSE}
+library(lubridate)
+library(caret)
+library(dplyr)
+library(DMwR)
+library(ROSE)
+library(ggplot2)
+library(randomForest)
+library(rpart)
+library(rpart.plot)
+library(data.table)
+library(e1071)
+library(gridExtra)
+library(Amelia)
+library(caTools)
+```
+
+```{r Lê os dados de treino e de teste e verifica sua estrutura}
+train <-fread('train.csv', stringsAsFactors = FALSE, data.table = FALSE)
+test <-fread('test.csv', stringsAsFactors = FALSE, data.table = FALSE)
+
+str(train)
+str(test)
+```
+Não há diferença entre dados de treino e teste, a não ser pela presença da variável
+target (is_attributed) nos dados de teste que devemos prever e da variável attributed_time (tempo levado para o download do app) que vem como 'NA' nos dados de teste).
+
+Verificando e estimando valores missing nos dados de treino
+```{r valores missing}
+colSums(is.na(train))
+
+```
+Não há valores missing, os dados estão limpos Attributed_time (Tempo levado para download) tem valores em branco.
+```{r}
+colSums(train=='')
+```
+Vamos verificar a variável target, quantos não foram baixados no dados de treino
+```{r}
+table(train$is_attributed)
+```
+
+Quando comparamos os valores em branco em 'Attributed_time' e a quantidade de 'is_attributed = 0' (quantidade de aplicações não baixadas) nos dados de treino, vemos que esses valores são iguais.
+Observa-se que a variável 'Attributed_time' não está presente nos dados de teste, portanto, não há motivos para mantê-la nos dados do treino também.
+
+```{r}
+train$attributed_time=NULL
+```
+
+## Data Munging e Feature Engineering
+
+Feature engineering é o processo de determinar quais variáveis preditoras contribuirão para a capacidade preditiva do algoritmo de aprendizado de máquina. 
+
+Data Munging é o processo de transformar e mapear dados "bruto" em outro formato com a intenção de torná-lo mais apropriado e valioso para uma análise de dados.
+
+Vamos utilizar esses dois conceitos, começando na conversão click_time para o formato data e hora
+```{r}
+train$click_time<-as.POSIXct(train$click_time,
+                             format = "%Y-%m-%d %H:%M",tz = "America/Sao_Paulo")
+```
+
+Separando ano, mês, dia da semana e hora
+```{r}
+train$year=year(train$click_time)
+train$month=month(train$click_time)
+train$days=weekdays(train$click_time)
+train$hour=hour(train$click_time)
+```
+
+Depois de obter essas novas variáveis, vamos remover a variável original "click_time"
+```{r}
+train$click_time=NULL
+```
+
+Verificando valores únicos para cada variável obtida de click_time
+```{r}
+apply(train,2, function(x) length(unique(x)))
+```
+
+Verificando os valores únicos, podemos ver que temos datas coletadas para um único mês, em um determinado ano, ou seja, o dados se repete a cada linha e então, não há necessidade de manter essas variáveis mês e ano.
+```{r}
+train$month=NULL
+train$year=NULL
+```
+Convertendo as variáveis "is_attributed" e "days" em variáveis do tipo fator
+```{r}
+train$is_attributed=as.factor(train$is_attributed)
+train$days=as.factor(train$days)
+```
+## Análise exploratória de dados para verificar a importância das variáveis para a previsão
+
+ is_attributed (App foi baixado) versus App_id para marketing
+```{r}
+p1=ggplot(train,aes(x=is_attributed,y=app,fill=is_attributed))+
+  geom_boxplot()+
+  ggtitle("Aplicação ID versus Is_attributed")+
+  xlab("App ID") +
+  labs(fill = "is_attributed") 
+
+p2=ggplot(train,aes(x=app,fill=is_attributed))+
+  geom_density()+facet_grid(is_attributed~.)+
+  scale_x_continuous(breaks = c(0,50,100,200,300,400))+
+  ggtitle("Aplicação ID versus Is_attributed")+
+  xlab("App ID") +
+  labs(fill = "is_attributed")  
+
+p3=ggplot(train,aes(x=is_attributed,y=app,fill=is_attributed))+
+  geom_violin()+
+  ggtitle("Aplicação ID versus Is_attributed")+
+  xlab("App ID") +
+  labs(fill = "is_attributed")  
+
+grid.arrange(p1,p2, p3, nrow=2,ncol=2)
+
+```
+
+
+Observe o padrão e a forma diferente em todos os gráficos is_attributed (App foi baixado) versus App id no marketing, especialmente a diferenciação clara no Boxplot Isso definitivamente vai ser umas das variáveis importantes para diferenciar usuários que baixaram a aplicação ou não.
+
+is_attributed (App foi baixada) versus versão do sistema operacional (OS) do celular:
+
+
+```{r}
+p4=ggplot(train,aes(x=is_attributed,y=os,fill=is_attributed))+
+  geom_boxplot()+
+  ggtitle("versão OS versus Is_attributed")+
+  xlab("Versão OS") +
+  labs(fill = "is_attributed")  
+
+
+p5=ggplot(train,aes(x=os,fill=is_attributed))+
+  geom_density()+facet_grid(is_attributed~.)+
+  scale_x_continuous(breaks = c(0,50,100,200,300,400))+
+  ggtitle("Versão OS versus Is_attributed ")+
+  xlab("Versão OS") +
+  labs(fill = "is_attributed")
+
+
+p6=ggplot(train,aes(x=is_attributed,y=os,fill=is_attributed))+
+  geom_violin()+
+  ggtitle("Versão OS versus Is_attributed")+
+  xlab("Versão OS") +
+  labs(fill = "is_attributed")  
+
+
+grid.arrange(p4,p5, p6, nrow=2,ncol=2)
+```
+
+
+App foi baixada versus endereço ip do click.
+
+
+```{r}
+p7=ggplot(train,aes(x=is_attributed,y=ip,fill=is_attributed))+
+  geom_boxplot()+
+  ggtitle("IP Address versus Is_attributed")+
+  xlab("Ip Adresss of click") +
+  labs(fill = "is_attributed")  
+
+
+p8=ggplot(train,aes(x=ip,fill=is_attributed))+
+  geom_density()+facet_grid(is_attributed~.)+
+  scale_x_continuous(breaks = c(0,50,100,200,300,400))+
+  ggtitle("IP Address versus Is_attributed")+
+  xlab("Ip Adresss of click") +
+  labs(fill = "is_attributed")  
+
+
+
+p9=ggplot(train,aes(x=is_attributed,y=ip,fill=is_attributed))+
+  geom_violin()+
+  ggtitle("IP Address versus Is_attributed")+
+  xlab("Ip Adresss of click") +
+  labs(fill = "is_attributed")  
+
+grid.arrange(p7,p8, p9, nrow=2,ncol=2)
+```
+
+
+O endereço IP (IP Address) pode, muito bem, desempenhar um papel importante na previsão pois há diferenciação entre os dois grupos
+App foi baixada versus ID do tipo de dispositivo do usuário
+
+
+```{r}
+p10=ggplot(train,aes(x=device,fill=is_attributed))+
+  geom_density()+facet_grid(is_attributed~.)+
+  ggtitle("Device type versus Is_attributed")+
+  xlab("Device Type ID") +
+  labs(fill = "is_attributed")  
+
+
+p11=ggplot(train,aes(x=is_attributed,y=device,fill=is_attributed))+
+  geom_boxplot()+
+  ggtitle("Device type versus Is_attributed")+
+  xlab("Device Type ID") +
+  labs(fill = "is_attributed")  
+
+
+p12=ggplot(train,aes(x=is_attributed,y=device,fill=is_attributed))+
+  geom_violin()+
+  ggtitle("Device type versus Is_attributed")+
+  xlab("Device Type ID") +
+  labs(fill = "is_attributed")  
+
+grid.arrange(p10,p11, p12, nrow=2,ncol=2)
+
+```
+
+
+Não há diferenciação entre dispositivo (device) e is_attributed, não sendo importante para nossa análise
+
+App foi baixada (is_attributed) versus ID do canal do editor de anúncios para celular
+
+
+```{r}
+p13=ggplot(train,aes(x=channel,fill=is_attributed))+
+  geom_density()+facet_grid(is_attributed~.)+
+  ggtitle("Channel versus Is_attributed")+
+  xlab("Channel of mobile") +
+  labs(fill = "is_attributed")  
+
+
+p14=ggplot(train,aes(x=is_attributed,y=channel,fill=is_attributed))+
+  geom_boxplot()+
+  ggtitle("Channel versus Is_attributed")+
+  xlab("Channel of mobile") +
+  labs(fill = "is_attributed")  
+
+p15=ggplot(train,aes(x=is_attributed,y=channel,fill=is_attributed))+
+  geom_violin()+
+  ggtitle("Channel versus Is_attributed")+
+  xlab("Channel of mobile") +
+  labs(fill = "is_attributed")  
+
+grid.arrange(p13,p14, p15, nrow=2,ncol=2)
+```
+
+
+O canal do editor tem possibilidades de ajudar na previsão,podemos usar essa variável na análise de variáveis (feature)
+
+A hora específica tem alguma relação com o download do app 
+
+
+```{r}
+p16=ggplot(train,aes(x=hour,fill=is_attributed))+
+  geom_density()+facet_grid(is_attributed~.)+
+  ggtitle("Hour versus Is_attributed ")+
+  xlab("Hour") +
+  labs(fill = "is_attributed")  
+
+p17=ggplot(train,aes(x=is_attributed,y=hour,fill=is_attributed))+
+  geom_boxplot()+
+  ggtitle("Hour versus Is_attributed")+
+  xlab("Hour") +
+  labs(fill = "is_attributed")  
+
+p18=ggplot(train,aes(x=is_attributed,y=channel,fill=is_attributed))+
+  geom_violin()+
+  ggtitle("Hour versus Is_attributed")+
+  xlab("Hour") +
+  labs(fill = "is_attributed")  
+
+grid.arrange(p16,p17, p18, nrow=2,ncol=2)
+
+```
+
+
+Há uma leve diferenciação em ambas as distruibuição, podemos dizer que é uma variável menos importante
+
+Um dia específico tem algo a ver com o download da aplicação?
+
+
+```{r}
+p19=ggplot(train,aes(x=days,fill=is_attributed))+
+  geom_density()+facet_grid(is_attributed~.)+
+  ggtitle("Dia da semana versus Is_attributed ")+
+  xlab("Os version") +
+  labs(fill = "is_attributed")  
+
+
+p20=ggplot(train,aes(x=days,fill=is_attributed))+geom_density(col=NA,alpha=0.35)+
+  ggtitle("dias versus clique")+
+  xlab("Dia da semana versus Is_attributed ") +
+  ylab("Total Count") +
+  labs(fill = "is_attributed")  
+
+grid.arrange(p19,p20, ncol=2)
+
+```
+
+Parece que não há relação entre a variável dia e attributed_id
+
+## Aplicação dos Modelos
+
+Validação sobre a análise das variáveis
+
+ 1. para todas as variáveis
+
+ 2. para variáveis selecionadas por meio da análise exploratória de dados
+
+
+### 1. Modelo para todas as variáveis
+
+Utilizando o pacote caret para particionar os dados de treino para aplicar ao modelo
+
+
+```{r}
+set.seed(1234)
+cv.10 <- createMultiFolds(train$is_attributed, k = 10, times = 10)
+
+```
+
+ Utilização da validação cruzada (cross-validation) que divide os dados em 10 partes e roda o modelo 10 vezes, cada vez usando uma das partes diferentes como validação. O método repeatedcv é um bom começo.
+
+
+```{r}
+ctrl <- trainControl(method = "repeatedcv", number = 10, repeats = 10,
+                     index = cv.10)
+```
+
+Esta função configura conjuntos de dados de treino para uma série de classificações e regressões, ajusta os modelos e calcula uma medida de desempenho baseada em reamostragem (partições dos dados de treino).
+ 
+
+```{r}
+set.seed(1234)
+Model_CDT <- train(x = train[,-6], y = train[,6], method = "rpart", tuneLength = 30,
+                   trControl = ctrl)
+
+PRE_VDTS=predict(Model_CDT$finalModel,data=train,type="class")
+confusionMatrix(PRE_VDTS,train$is_attributed)
+
+```
+ 
+Verificando a acurácia, apesar da acurácia está muito alta, mas a especificidade é muito baixa
+
+
+### 2. Modelo para variáveis selecionadas
+```{r}
+train$days=NULL
+train$os=NULL
+train$device=NULL
+
+set.seed(1234)
+
+Model_CDT1 <- train(x = train[,-4], y = train[,4], method = "rpart", tuneLength = 30,
+                    trControl = ctrl)
+
+PRE_VDTS1=predict(Model_CDT1$finalModel,data=train,type="class")
+confusionMatrix(PRE_VDTS1,train$is_attributed)
+```
+
+Nesse segundo modelo, chega-se a mesma acurácia, no entanto há uma mudança drástica na especificidade. Então, iniciamos usando somente variáveis selecionadas para o nosso modelo atual Particição dos dados. Antes de fazer qualquer coisa, Vamos dividir os dados em dados de treino e dados de testes usando pacote caret.
+
+
+```{r}
+set.seed(5000)
+ind=createDataPartition(train$is_attributed,times=1,p=0.7,list=FALSE)
+train_val=train[ind,]
+test_val=train[-ind,]
+```
+
+Verificar a proporção:
+
+
+```{r}
+round(prop.table(table(train$is_attributed)*100),digits = 3)
+round(prop.table(table(train_val$is_attributed)*100),digits = 3)
+round(prop.table(table(test_val$is_attributed)*100),digits = 3)
+```
+
+Observe que o Caret divide os dados na taxa de 70% e 30% e de que não há variação na proporção da variável target
+
+
+Balanceando os dados usando o Smote
+
+No final, verifica-se que todas as técnicas tais como up sampling, down sampling, Rose and smote, e entre esses, o Smote se sobressaiu com boa acurária
+
+Vamos aplicar o smote e tentar equilibrar os dados:
+
+```{r}
+set.seed(1234)
+smote_train = SMOTE(is_attributed ~ ., data  = train_val)                         
+table(smote_train$is_attributed)
+```
+
+#Algoritmo de Aprendizado de Máquina e Validação Cruzada
+
+#Árvore de Decisão
+
+```{r}
+set.seed(1234)
+cv.10 <- createMultiFolds(smote_train$is_attributed, k = 10, times = 10)
+```
+
+Controle
+
+```{r}
+ctrl <- trainControl(method = "repeatedcv", number = 10, repeats = 10,
+                     index = cv.10)
+set.seed(1234)
+```
+
+Treina o modelo
+
+```{r}
+Model_CDT <- train(x = smote_train[,-4], y = smote_train[,4], method = "rpart", tuneLength = 30,
+                   trControl = ctrl)
+
+rpart.plot(Model_CDT$finalModel,extra =  3,fallen.leaves = T)
+
+PRE_VDTS=predict(Model_CDT$finalModel,newdata=test_val,type="class")
+confusionMatrix(PRE_VDTS,test_val$is_attributed)
+```
+
+Somos capazes de completar Árvore de Decisão com 0,94% de acurácia, e especificidade aumentada para 0,78% (Lembre-se, aumento drástico em especificidade depois do balanceamento dos dados)
+
+
+# Random forest
+
+```{r}
+cv.10 <- createMultiFolds(smote_train$is_attributed, k = 10, times = 10)
+```
+
+Controle
+
+```{r}
+ctrl <- trainControl(method = "repeatedcv", number = 10, repeats = 10,
+                     index = cv.10)
+set.seed(1234)
+set.seed(1234)
+rf.5<- train(x = smote_train[,-4], y = smote_train[,4], method = "rf", tuneLength = 3,
+             ntree = 100, trControl =ctrl)
+
+rf.5
+
+pr.rf=predict(rf.5,newdata = test_val)
+
+confusionMatrix(pr.rf,test_val$is_attributed)
+```
+
+O modelo Random forest nos dá 95% accuracy, 1% melhor que decision tree, mas observe que não há muita mudança na especificidade
+
+#Support Vector Machine (SVM): Linear Support vector Machine (LSVM)
+
+Antes de entrar no modelo, vamos ajustar o parâmetro custo (pacote e1071)
+
+```{r}
+set.seed(1234)
+liner.tune=tune.svm(is_attributed~.,data=smote_train,kernel="linear",cost=c(0.1,0.5,1,5,10,50))
+
+liner.tune
+```
+
+Vamos pegar o melhor modelo linear
+
+```{r}
+best.linear=liner.tune$best.model
+```
+
+Dados de previsão
+
+```{r}
+best.test=predict(best.linear,newdata=test_val,type="class")
+confusionMatrix(best.test,test_val$is_attributed)
+```
+
+A Acurácia diminui no modelo Linear SVM, SVM não é um bom modelo para esses dados
+
+# Radial Support vector Machine
+Vamos aplicar o SVM não linear, Radial Kernel
+
+```{r}
+set.seed(1234)
+rd.poly=tune.svm(is_attributed~.,data=smote_train,kernel="radial",gamma=seq(0.1,5))
+
+summary(rd.poly)
+
+best.rd=rd.poly$best.model
+
+```
+
+Vamos fazer previsões nos dados de teste
+
+```{r}
+pre.rd=predict(best.rd,newdata = test_val)
+
+confusionMatrix(pre.rd,test_val$is_attributed)
+
+pre.rd=predict(best.rd,newdata = test_val)
+
+confusionMatrix(pre.rd,test_val$is_attributed)
+
+```
+
+Embora o Radial faz melhor que o linear, no geral, a precisão não é boa.
+
+Conclusão: poderíamos ter alcançado 99% de acurácia simplesmente usando os dados sem fazer "class balance".
+
+
+# REGRESSÃO LOGÍSTICA
+
+Treinando o modelo
+
+```{r}
+log.model <- glm(formula = is_attributed ~ . , family = binomial(link = 'logit'), data = train)
+```
+
+Podemos ver que as variaveis Sex, Age e Pclass sao as variaveis mais significantes
+
+```{r}
+summary(log.model)
+```
+
+Fazendo as previsoes nos dados de teste
+
+Split dos dados
+
+```{r}
+set.seed(101)
+split = sample.split(train$is_attributed, SplitRatio = 0.70)
+```
+
+Datasets de treino e de teste
+
+```{r}
+dados_treino_final = subset(train, split == TRUE)
+dados_teste_final = subset(test, split == FALSE)
+
+```
+
+Gerando o modelo com a versao final do dataset
+
+```{r}
+final.log.model <- glm(formula = is_attributed ~ . , family = binomial(link='logit'), data = dados_treino_final)
+```
+
+Resumo
+
+```{r}
+summary(final.log.model)
+
+```
+
+Prevendo a acurácia
+
+```{r}
+fitted.probabilities <- predict(final.log.model, newdata = dados_treino_final, type = 'response')
+```
+
+Calculando os valores
+
+```{r}
+fitted.results <- ifelse(fitted.probabilities > 0.5, 1, 0)
+```
+
+Conseguimos 99% de acurácia
+
+```{r}
+misClasificError <- mean(fitted.results != dados_treino_final$is_attributed)
+print(paste('Acuracia', (1-misClasificError)*100))
+```
+
+Criando a confusion matrix
+
+```{r}
+table(dados_treino_final$is_attributed, fitted.probabilities > 0.5)
+
+confusionMatrix(factor(fitted.results),dados_treino_final$is_attributed)
+
+```
+
+# Modelo NAIVE BAYES
+
+```{r}
+nb_model <- naiveBayes(is_attributed ~ ., data = train)
+```
+
+Visualizando o resultado
+
+```{r}
+nb_model
+summary(nb_model)
+str(nb_model)
+```
+
+Previsões
+
+```{r}
+nb_test_predict <- predict(nb_model, train)
+```
+
+Confusion matrix
+
+```{r}
+table(pred = nb_test_predict, true = train$is_attributed)
+
+confusionMatrix(nb_test_predict,train$is_attributed)
+
+```
+Chega-se a uma acurácia de 99% nesse modelo!
+
+
+Este trabalho foi um esforço de revisão dos capítulos do curso de R, principalmente o capítulo 8, e a composição de alguns trabalhos disponíveis no site do kaggle. Percebe-se agora a dimensão da aplicabilidade dos conceitos vistos no curso com os trabalhos do mundo profissional. Valeu a pena pesquisar a análise dos dados e a comparação entre os cinco modelos de aprendizagem de máquina para um entendimento melhor da área de Ciência de Dados.
+
